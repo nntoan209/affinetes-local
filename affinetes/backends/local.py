@@ -221,12 +221,16 @@ class LocalBackend(AbstractBackend):
                 "restart_policy": {"Name": "always"},
                 "force_recreate": self._force_recreate,
                 "mem_limit": self._mem_limit,
+                "network": "host",
                 **docker_kwargs
             }
             
+            # Check if using host networking
+            using_host_network = container_config.get("network_mode") == "host" or container_config.get("network") == "host"
+            
             # Network handling: Only needed for local DinD deployment
             # Remote deployment uses SSH tunnel, so no network configuration needed
-            if not self._is_remote:
+            if not self._is_remote and not using_host_network:
                 # Local deployment: check if running inside Docker (DinD scenario)
                 is_running_in_docker = self._is_running_in_docker()
                 if is_running_in_docker:
@@ -240,7 +244,12 @@ class LocalBackend(AbstractBackend):
             self._container = self._docker_manager.start_container(**container_config)
             
             # Determine access address
-            if self._is_remote:
+            if using_host_network:
+                # Host networking: use localhost
+                local_host = "localhost"
+                local_port = 8000
+                logger.info(f"Host networking mode, accessing via localhost: {local_host}:{local_port}")
+            elif self._is_remote:
                 # Remote deployment: create SSH tunnel
                 container_ip = self._docker_manager.get_container_ip(self._container)
                 logger.debug("Remote deployment detected, creating SSH tunnel")
