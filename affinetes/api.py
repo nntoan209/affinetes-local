@@ -5,7 +5,7 @@ import asyncio
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
-from .backends import LocalBackend, BasilicaBackend
+from .backends import LocalBackend, BasilicaBackend, URLBackend
 from .infrastructure import ImageBuilder
 from .core import EnvironmentWrapper, get_registry, InstancePool, InstanceInfo
 from .utils.logger import logger
@@ -159,10 +159,11 @@ def load_env(
             if replicas != 1:
                 raise ValidationError("connect_only mode only supports single instance (replicas=1)")
         else:
-            if not image:
-                raise ValidationError("image is required when connect_only=False")
+            # URL mode doesn't require image parameter
+            if mode != "url" and not image:
+                raise ValidationError("image is required for docker and basilica modes")
         
-        logger.debug(f"Loading '{image or container_name}' in {mode} mode (replicas={replicas}, connect_only={connect_only})")
+        logger.debug(f"Loading '{image or container_name or 'url-service'}' in {mode} mode (replicas={replicas}, connect_only={connect_only})")
         
         if replicas < 1:
             raise ValidationError("replicas must be >= 1")
@@ -254,9 +255,19 @@ def _load_single_instance(
             image=image,
             **backend_kwargs
         )
+    elif mode == "url":
+        # URL mode for user-deployed environments
+        if "base_url" not in backend_kwargs:
+            raise ValidationError(
+                "URL mode requires 'base_url' parameter. "
+                "Example: base_url='http://your-service.com:8080'"
+            )
+        backend = URLBackend(
+            **backend_kwargs
+        )
     else:
         raise ValidationError(
-            f"Invalid mode: {mode}. Must be 'docker' or 'basilica'."
+            f"Invalid mode: {mode}. Must be 'docker', 'basilica', or 'url'."
         )
     
     # Create wrapper
