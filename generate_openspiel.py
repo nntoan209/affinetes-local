@@ -7,6 +7,8 @@ import json
 
 load_dotenv()
 
+NUM_SAMPLE_PER_GAME = 30
+NUM_CONCURRENT = 4
 AVAILABLE_GAMES = [
     # Tier 1: Excellent evaluation games (⭐⭐⭐⭐⭐)
     # High trajectory diversity, strong strategic depth, proven evaluation quality
@@ -66,8 +68,8 @@ async def main():
     
     for game_id in range(1000, 1000 + len(AVAILABLE_GAMES)):
         # Process config_ids in batches of 4
-        for batch_start in range(0, 30, 4):
-            batch_end = min(batch_start + 4, 30)
+        for batch_start in range(0, NUM_SAMPLE_PER_GAME, NUM_CONCURRENT):
+            batch_end = min(batch_start + NUM_CONCURRENT, NUM_SAMPLE_PER_GAME)
             print(f"Processing samples {batch_start} to {batch_end} for game {game_id}")
             
             # Create tasks for this batch
