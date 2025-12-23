@@ -3,7 +3,7 @@
 import time
 import asyncio
 from datetime import datetime
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Tuple
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -38,6 +38,8 @@ class LocalBackend(AbstractBackend):
         mem_limit: Optional[str] = None,
         auto_cleanup: bool = True,
         connect_only: bool = False,
+        host_network: bool = False,
+        host_port: Optional[int] = None,
         **docker_kwargs
     ):
         """
@@ -55,6 +57,8 @@ class LocalBackend(AbstractBackend):
             auto_cleanup: If True, automatically stop and remove container on cleanup (default: True)
                          If False, container will continue running after cleanup
             connect_only: If True, only connect to existing container without creating new one
+            host_network: If True, use host network mode (network_mode="host")
+            host_port: Port to use when host_network=True (default: 8000)
             **docker_kwargs: Additional Docker container options
         """
         self.image = image
@@ -83,10 +87,18 @@ class LocalBackend(AbstractBackend):
         self._pull = pull
         self._mem_limit = mem_limit
         self._auto_cleanup = auto_cleanup
+        self._host_network = host_network
+        self._host_port = host_port or 8000
         
         # SSH tunnel for remote access
         self._is_remote = host and host.startswith("ssh://")
         self._ssh_tunnel_manager = None
+        
+        # Track container restart: store StartedAt timestamp for restart detection
+        self._container_started_at = None
+        
+        # Cache runtime environment to avoid repeated detection
+        self._runtime_env: Optional[str] = None
         
         # Connect to existing container or start new one
         if connect_only:
@@ -122,39 +134,20 @@ class LocalBackend(AbstractBackend):
                 self._env_type = labels.get("affinetes.env.type", EnvType.FUNCTION_BASED)
                 logger.info(f"Environment type (from container): {self._env_type}")
             
-            # Determine access address (same logic as _start_container)
-            if self._is_remote:
-                # Remote: create SSH tunnel
-                container_ip = self._docker_manager.get_container_ip(self._container)
-                logger.debug("Remote connection detected, creating SSH tunnel")
-                self._ssh_tunnel_manager = SSHTunnelManager(self.host)
-                local_host, local_port = self._ssh_tunnel_manager.create_tunnel(
-                    remote_ip=container_ip,
-                    remote_port=8000
-                )
-                logger.info(f"Accessing via SSH tunnel: {local_host}:{local_port}")
-            else:
-                # Local deployment: detect runtime environment
-                runtime_env = self._detect_runtime_environment()
-                if runtime_env == "dood":
-                    # DOOD: Use container name as hostname
-                    local_host = self.name
-                    local_port = 8000
-                    logger.info(f"DOOD mode, accessing via container name: {local_host}:{local_port}")
-                else:
-                    # Host or DIND: Use container IP
-                    container_ip = self._docker_manager.get_container_ip(self._container)
-                    local_host = container_ip
-                    local_port = 8000
-                    logger.info(f"{runtime_env.upper()} mode, accessing via IP: {local_host}:{local_port}")
+            # Initialize connection address
+            local_host, local_port = self._initialize_connection_address()
             
-            # Create HTTP executor
+            # Create HTTP executor with configurable timeout
             self._http_executor = HTTPExecutor(
                 container_ip=local_host,
                 container_port=local_port,
                 env_type=self._env_type,
-                timeout=600
             )
+            
+            # Record container start time for restart detection
+            self._container.reload()
+            self._container_started_at = self._container.attrs["State"]["StartedAt"]
+            logger.debug(f"Container '{self.name}' started at: {self._container_started_at}")
             
             # Verify HTTP server is ready
             try:
@@ -180,6 +173,123 @@ class LocalBackend(AbstractBackend):
                 except:
                     pass
             raise BackendError(f"Failed to connect to container: {e}")
+    
+    def _needs_restart_detection(self) -> bool:
+        """Determine if restart detection is needed for current deployment mode
+        
+        Returns:
+            True if restart detection is needed, False otherwise
+        """
+        if self._is_remote:
+            # Remote: SSH tunnel bound to IP, must detect restarts
+            return True
+        
+        # DOOD: Docker DNS resolves container name, no detection needed
+        # DIND/Host: IP-based access, detection needed (though IP changes are rare)
+        return self._runtime_env != "dood"
+    
+    def _check_container_restart(self) -> bool:
+        """Check if container has restarted by comparing StartedAt timestamp
+        
+        Only performs check if restart detection is needed for current deployment mode.
+        
+        Returns:
+            True if container restarted, False otherwise
+        """
+        # Skip check if not needed (performance optimization)
+        if not self._needs_restart_detection():
+            return False
+        
+        if not self._container or not self._container_started_at:
+            return False
+        
+        try:
+            self._container.reload()
+            current_started_at = self._container.attrs["State"]["StartedAt"]
+            
+            if current_started_at != self._container_started_at:
+                logger.warning(
+                    f"Container '{self.name}' restart detected: "
+                    f"{self._container_started_at} → {current_started_at}"
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to check container restart: {e}")
+            return False
+    
+    def _initialize_connection_address(self) -> Tuple[str, int]:
+        """Initialize connection address based on deployment mode
+        
+        Returns:
+            (local_host, local_port) tuple
+        """
+        if self._is_remote:
+            # Remote: create SSH tunnel using container name
+            logger.debug("Remote connection detected, creating SSH tunnel")
+            self._ssh_tunnel_manager = SSHTunnelManager(self.host)
+            local_host, local_port = self._ssh_tunnel_manager.create_tunnel(
+                remote_host=self.name,
+                remote_port=8000
+            )
+            logger.info(f"Accessing via SSH tunnel: {local_host}:{local_port}")
+            return local_host, local_port
+        
+        # Local deployment: detect and cache runtime environment
+        if not self._runtime_env:
+            self._runtime_env = self._detect_runtime_environment()
+        
+        if self._runtime_env == "dood":
+            # DOOD: Use container name as hostname (Docker DNS)
+            local_host = self.name
+            local_port = 8000
+            logger.info(f"DOOD mode, accessing via container name: {local_host}:{local_port}")
+        else:
+            # Host or DIND: Use container IP
+            container_ip = self._docker_manager.get_container_ip(self._container)
+            local_host = container_ip
+            local_port = 8000
+            logger.info(f"{self._runtime_env.upper()} mode, accessing via IP: {local_host}:{local_port}")
+        
+        return local_host, local_port
+    
+    def _handle_container_restart(self) -> Tuple[str, int]:
+        """Handle container restart: update timestamp and recreate connection if needed
+        
+        Returns:
+            (local_host, local_port) tuple
+        """
+        logger.info(f"Handling container restart for '{self.name}'")
+        
+        # Update stored timestamp
+        self._container.reload()
+        self._container_started_at = self._container.attrs["State"]["StartedAt"]
+        logger.info(f"Updated container start time: {self._container_started_at}")
+        
+        # Remote: recreate SSH tunnel (IP may have changed)
+        if self._is_remote:
+            if self._ssh_tunnel_manager:
+                try:
+                    self._ssh_tunnel_manager.cleanup()
+                except Exception as e:
+                    logger.warning(f"Error cleaning up old tunnel: {e}")
+            
+            self._ssh_tunnel_manager = SSHTunnelManager(self.host)
+            local_host, local_port = self._ssh_tunnel_manager.create_tunnel(
+                remote_host=self.name,
+                remote_port=8000
+            )
+            logger.info(f"SSH tunnel recreated: {local_host}:{local_port}")
+            return local_host, local_port
+        
+        # Local DIND/Host: resolve new container IP
+        # (DOOD mode won't reach here due to _needs_restart_detection())
+        new_ip = self._docker_manager.get_container_ip(self._container)
+        local_host = new_ip
+        local_port = 8000
+        logger.info(f"{self._runtime_env.upper()} mode: updated to new IP {local_host}:{local_port}")
+        
+        return local_host, local_port
     
     def _start_container(self, env_vars: Optional[Dict[str, str]] = None, **docker_kwargs) -> None:
         """Start Docker container with HTTP server
@@ -207,11 +317,17 @@ class LocalBackend(AbstractBackend):
                 logger.info(f"Environment type (detected): {self._env_type}")
             
             # Merge environment variables
-            if env_vars:
+            merged_env_vars = env_vars.copy() if env_vars else {}
+            
+            # Add port configuration to environment if using host network
+            if self._host_network:
+                merged_env_vars["AFFINETES_PORT"] = str(self._host_port)
+            
+            if merged_env_vars:
                 if "environment" in docker_kwargs:
-                    docker_kwargs["environment"].update(env_vars)
+                    docker_kwargs["environment"].update(merged_env_vars)
                 else:
-                    docker_kwargs["environment"] = env_vars
+                    docker_kwargs["environment"] = merged_env_vars
             
             # Prepare container configuration
             container_config = {
@@ -228,12 +344,19 @@ class LocalBackend(AbstractBackend):
             # Check if using host networking
             using_host_network = container_config.get("network_mode") == "host" or container_config.get("network") == "host"
             
-            # Network handling: Only needed for local DOOD deployment
-            # Remote deployment uses SSH tunnel, so no network configuration needed
-            if not self._is_remote and not using_host_network:
-                # Local deployment: check if running inside Docker (DinD scenario)
-                is_running_in_docker = self._is_running_in_docker()
-                if is_running_in_docker:
+            # Network handling
+            if self._host_network:
+                # Host network mode requested
+                container_config["network_mode"] = "host"
+                logger.info("Using host network mode (network_mode='host')")
+            elif not self._is_remote:
+                # Only needed for local DOOD deployment
+                # Remote deployment uses SSH tunnel, so no network configuration needed
+                # Detect runtime environment
+                runtime_env = self._detect_runtime_environment()
+                
+                if runtime_env == "dood":
+                    # DOOD: Need to join the same network as affinetes container
                     network_name = self._ensure_docker_network()
                     container_config["network"] = network_name
                     logger.info(f"DOOD mode detected, connecting environment container to network: {network_name}")
@@ -247,44 +370,21 @@ class LocalBackend(AbstractBackend):
             # Start container
             self._container = self._docker_manager.start_container(**container_config)
             
-            # Determine access address
-            if using_host_network:
-                # Host networking: use localhost
+            # Initialize connection address
+            if self._host_network:
+                # Host network mode: use localhost with configured port
                 local_host = "localhost"
-                local_port = 8000
-                logger.info(f"Host networking mode, accessing via localhost: {local_host}:{local_port}")
-            elif self._is_remote:
-                # Remote deployment: create SSH tunnel
-                container_ip = self._docker_manager.get_container_ip(self._container)
-                logger.debug("Remote deployment detected, creating SSH tunnel")
-                self._ssh_tunnel_manager = SSHTunnelManager(self.host)
-                local_host, local_port = self._ssh_tunnel_manager.create_tunnel(
-                    remote_ip=container_ip,
-                    remote_port=8000
-                )
-                logger.info(f"Accessing via SSH tunnel: {local_host}:{local_port}")
+                local_port = self._host_port
+                logger.info(f"Host network mode, accessing via localhost: {local_host}:{local_port}")
             else:
-                # Local deployment: detect runtime environment
-                runtime_env = self._detect_runtime_environment()
-                
-                if runtime_env == "dood":
-                    # DOOD: Use container name as hostname
-                    local_host = self.name
-                    local_port = 8000
-                    logger.info(f"DOOD mode, accessing via container name: {local_host}:{local_port}")
-                else:
-                    # Host or DIND: Use container IP
-                    container_ip = self._docker_manager.get_container_ip(self._container)
-                    local_host = container_ip
-                    local_port = 8000
-                    logger.info(f"{runtime_env.upper()} mode, accessing via IP: {local_host}:{local_port}")
+                local_host, local_port = self._initialize_connection_address()
             
             # Create HTTP executor with accessible address
+            # Use longer timeout for long-running tasks (default 1800s = 30 minutes)
             self._http_executor = HTTPExecutor(
                 container_ip=local_host,
                 container_port=local_port,
                 env_type=self._env_type,
-                timeout=600
             )
             
             # Wait for HTTP server to be ready
@@ -305,6 +405,11 @@ class LocalBackend(AbstractBackend):
                     f"HTTP server did not start within {timeout}s. "
                     "Check container logs for errors."
                 )
+            
+            # Record container start time for restart detection
+            self._container.reload()
+            self._container_started_at = self._container.attrs["State"]["StartedAt"]
+            logger.debug(f"Container '{self.name}' started at: {self._container_started_at}")
             
             # Mark as setup - HTTP backend is ready after container starts
             self._is_setup = True
@@ -466,6 +571,9 @@ class LocalBackend(AbstractBackend):
         """
         Call a method from env.py via HTTP (async)
         
+        Proactively checks for container restart before each call and recreates
+        connection if needed. This ensures requests always target the correct container.
+        
         Args:
             method_name: Method name to call
             *args: Positional arguments
@@ -475,13 +583,25 @@ class LocalBackend(AbstractBackend):
             Method result
         """
         try:
+            # Check if container restarted (proactive detection)
+            if self._check_container_restart():
+                logger.info(f"Container restart detected before calling '{method_name}', updating connection")
+                new_host, new_port = self._handle_container_restart()
+                # Update HTTP executor base URL
+                self._http_executor.base_url = f"http://{new_host}:{new_port}"
+                logger.info(f"Updated HTTPExecutor base URL to: {self._http_executor.base_url}")
+                # Wait briefly for container to stabilize
+                await asyncio.sleep(2)
+            
+            # Execute method call (without retry logic - connection is now correct)
             return await self._http_executor.call_method(
                 method_name,
                 *args,
                 **kwargs
             )
         except Exception as e:
-            raise BackendError(f"Method call failed: {e}")
+            # Preserve full exception chain for debugging
+            raise BackendError(f"Method call failed: {e}") from e
     
     async def list_methods(self) -> list:
         """

@@ -16,7 +16,7 @@ WORKDIR /app
 
 RUN git clone --recurse-submodules https://github.com/angosr/AgentGym.git AgentGym \
     && cd AgentGym \
-    && git checkout 81d8c5fc7ddca4b3c929264ee7bf3791c867b085 \
+    && git checkout b0afbc19504ead9bbdffa0e070a061a3b89879f2 \
     && git submodule update --init --recursive
 
 ENV PATH=/opt/miniconda/envs/agentenv/bin:/opt/miniconda/bin:$PATH
@@ -39,11 +39,16 @@ ENV TOOL_NAME=${TOOL_NAME}
 COPY env.py /app/
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=2 \
-    CMD curl -f http://localhost:8000/health || exit 1
+  CMD sh -c "curl -f http://localhost:${AFFINETES_PORT:-8000}/health || exit 1"
 
 WORKDIR /sandbox
 # IMPORTANT: Must use single worker mode (no --workers or --workers 1)
 # Reason: AgentGym evaluator creates stateful agents that callback to the same server
 # Multiple workers would cause requests to be routed to different processes, losing state
 # For better performance within single process, use asyncio event loop
-CMD ["uvicorn", "env:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "/app", "--loop", "asyncio", "--workers", "1"]
+CMD uvicorn env:app \
+  --host 0.0.0.0 \
+  --port ${AFFINETES_PORT:-8000} \
+  --app-dir /app \
+  --loop asyncio \
+  --workers 1

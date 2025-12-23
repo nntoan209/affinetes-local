@@ -15,10 +15,14 @@ if '/app' not in sys.path:
 from sat import SATTask
 from abd import ABDTask
 from ded import DEDTask
-from dataset import R2Dataset
+from dataset import HFDataset
 
-# Global R2Dataset instance - created on module import to trigger background download
-_global_dataset = R2Dataset(dataset_name="satpalsr/rl-python")
+# Global HFDataset instance - created on module import to preload dataset
+_global_dataset = HFDataset(
+    dataset_name="AffineFoundation/rl-python",
+    split="train",
+    preload=False
+)
 
 class Actor:
     """Multi-task evaluation actor"""
@@ -40,7 +44,7 @@ class Actor:
         self.api_key = api_key or os.getenv("CHUTES_API_KEY")
     
     async def _llm_chat(self, prompt, model, base_url, timeout, temperature, current_api_key, seed=None):
-        """Call LLM API with specified API key and optional seed"""
+        """Call LLM API with specified API key and optional seed (streaming mode)"""
         # Unset SSL_CERT_FILE to avoid certificate path issues in container
         # Let httpx/certifi use default certificate bundle
         import os
@@ -54,29 +58,44 @@ class Actor:
             max_retries=0
         )
 
-        # Prepare API call parameters
+        # Prepare API call parameters with streaming enabled
         params = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
-            "stream": False
+            "stream": True,
+            "stream_options": {"include_usage": True}
         }
         
         # Add seed if provided
         if seed is not None:
             params["seed"] = seed
 
-        response = await client.chat.completions.create(**params)
+        stream = await client.chat.completions.create(**params)
         
-        # Handle case where API returns None content
-        if not response.choices:
-            raise ValueError("LLM API returned empty choices list")
+        # Collect streamed content and usage
+        content_parts = []
+        usage = None
         
-        content = response.choices[0].message.content
-        if content is None:
+        async for chunk in stream:
+            # Collect content chunks
+            if chunk.choices and chunk.choices[0].delta.content:
+                content_parts.append(chunk.choices[0].delta.content)
+            
+            # Collect usage information from the final chunk
+            if chunk.usage:
+                usage = chunk.usage.model_dump()
+        
+        # Combine all content parts
+        if not content_parts:
+            raise ValueError("LLM API returned empty content stream")
+        
+        content = "".join(content_parts)
+        if not content:
             raise ValueError("LLM API returned None content (possible content filtering or API error)")
         
-        return content.strip()
+        # Return both content and usage information
+        return content.strip(), usage
     
     async def evaluate(
         self,
@@ -127,8 +146,9 @@ class Actor:
         challenge = await task_instance.generate(task_id=task_id)
         
         # Call LLM
+        usage = None
         try:
-            resp = await self._llm_chat(challenge.prompt, model, base_url, timeout, temperature, current_api_key, seed)
+            resp, usage = await self._llm_chat(challenge.prompt, model, base_url, timeout, temperature, current_api_key, seed)
             error = None
         except Exception as e:
             import traceback
@@ -152,7 +172,8 @@ class Actor:
             "time_taken": time.time() - start,
             "extra": {
                 "conversation": conversation,
-                "seed": seed
+                "seed": seed,
+                "usage": usage
             }
         }
         

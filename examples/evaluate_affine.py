@@ -3,6 +3,7 @@ import os
 import sys
 import asyncio
 from dotenv import load_dotenv
+import json
 
 load_dotenv(override=True)
 
@@ -20,41 +21,28 @@ async def main():
         sys.exit(1)
 
     print("\n1. Loading environment from pre-built image 'affine:latest'...")
+    # af_env.build_image_from_env(
+    #     env_path="environments/affine",
+    #     image_tag="affine-env:v4",
+    # )
     
     env = af_env.load_env(
-        image="bignickeye/affine:v2",
+        image="affinefoundation/affine-env:v4",
         mode="docker",
         env_vars={"CHUTES_API_KEY": api_key},
-        pull=True
+        pull=True,
+        force_recreate=True,
     )
     print("   ✓ Environment loaded (container started with HTTP server)")
 
     try:
-        print("\n2. Available methods in environment:")
-        await env.list_methods(print_info=True)
-
-        print("\n3. Running evaluation in container (async)...")
         result = await env.evaluate(
             task_type="abd",
-            task_id=240,
+            task_id=20222,
             model="deepseek-ai/DeepSeek-V3.1",
-            base_url="https://llm.chutes.ai/v1"
+            base_url="https://llm.chutes.ai/v1",
         )
-        
-        if 'error' in result:
-            print(f"\n   Error occurred:")
-            print(f"     Error type: {result.get('error_type', 'unknown')}")
-            print(f"     Error: {result['error'][:200]}...")
-            return
-
-        print(f"\nResults:")
-        print(f"   Task: {result['task_name']}")
-        print(f"   Reward: {result['score']}")
-        print(f"   Success: {result['success']}")
-        print(f"   Time taken: {result['time_taken']:.2f}s")
-        if 'extra' in result:
-            print(f"\n   extra:")
-            print(f"     {result['extra']}...")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
     except Exception as e:
         print(f"\n   ❌ Execution failed: {e}")
         import traceback

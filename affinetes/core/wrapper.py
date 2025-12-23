@@ -244,8 +244,8 @@ class EnvironmentWrapper:
                 )
             except Exception as e:
                 raise EnvironmentError(
-                    f"Method '{name}' failed on environment '{self.name}': {e}"
-                )
+                    f"Method '{name}' failed on environment '{self.name}': {type(e).__name__}: {e}\n"
+                ) from e
         
         return method_caller
     

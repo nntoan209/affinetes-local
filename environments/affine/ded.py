@@ -5,7 +5,7 @@ import asyncio
 import logging
 from typing import Any, Dict
 from executor import ProgramExecutor
-from dataset import R2Dataset
+from dataset import HFDataset
 from models import Challenge
 
 # Logger
@@ -42,14 +42,14 @@ class DEDTask:
         Initialize DED task.
         
         Args:
-            dataset: Optional pre-initialized R2Dataset instance to use
-            dataset_name: Name of the R2 dataset to use (only if dataset not provided)
+            dataset: Optional pre-initialized HFDataset instance to use
+            dataset_name: Name of the HuggingFace dataset to use (only if dataset not provided)
         """
         self._executor = ProgramExecutor()
-        self._dataset = dataset if dataset is not None else R2Dataset(dataset_name=dataset_name)
+        self._dataset = dataset if dataset is not None else HFDataset(dataset_name=dataset_name, split="train", preload=False)
 
     async def generate(self, task_id: int = None) -> Challenge:
-        """Generate a coding challenge from R2 dataset
+        """Generate a coding challenge from HuggingFace dataset
         
         Args:
             task_id: Optional task ID for deterministic sample selection.
@@ -156,10 +156,18 @@ class DEDTask:
                 continue
 
             try:
-                out, err = await loop.run_in_executor(
-                    None, self._executor.execute, exec_prog, inp
+                # Add timeout protection: executor timeout (30s) + 5s buffer
+                out, err = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, self._executor.execute, exec_prog, inp
+                    ),
+                    timeout=self._executor.timeout + 5
                 )
+            except asyncio.TimeoutError:
+                logger.warning(f"Test case {i} timed out after {self._executor.timeout + 5}s")
+                out, err = "", "[EXECUTOR_TIMEOUT]"
             except Exception as e:
+                logger.warning(f"Test case {i} raised exception: {e}")
                 out, err = "", str(e)
 
             ok_run = not err.strip()
@@ -171,7 +179,8 @@ class DEDTask:
                 passed += 1
                 logger.debug(f"Test case {i} passed")
             else:
-                logger.debug(f"Test case {i} failed. Got: {out_norm!r}, Expected: {exp_norm!r}")
+                logger.debug(f"Test case {i} failed. Got: {out_norm!r}, Expected: {exp_norm!r}, Error: {err[:100]}")
+                break
 
         score = 1.0 if passed == total else 0.0
         logger.debug(f"DED evaluation completed with score: {score} ({passed}/{total})")
