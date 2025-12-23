@@ -12,6 +12,9 @@ import openai
 import httpx
 import pyspiel
 
+import sys
+sys.path.insert(0, 'environments/openspiel')
+
 from llm_bot import LLMBot
 from game_config import create_game
 from agents import GAME_AGENTS
