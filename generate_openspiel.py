@@ -9,6 +9,7 @@ load_dotenv()
 
 NUM_SAMPLE_PER_GAME = 30
 NUM_CONCURRENT = 4
+
 AVAILABLE_GAMES = [
     # Tier 1: Excellent evaluation games (⭐⭐⭐⭐⭐)
     # High trajectory diversity, strong strategic depth, proven evaluation quality
@@ -48,6 +49,18 @@ AVAILABLE_GAMES = [
     "solitaire",        # idx=18: Card sequencing, shuffled deck (high diversity), ~30-100 steps
 ]
 
+SKIP_GAMES = [
+    "gin_rummy",
+    "othello",
+    "backgammon",
+    "go",
+    "chess",
+    "checkers",
+    "2048",
+    "solitaire"
+]
+SKIP_INDICES = [AVAILABLE_GAMES.index(game) for game in SKIP_GAMES]
+
 actor = Actor(api_key=os.getenv("OPENROUTER_API_KEY"))
 
 async def main():
@@ -59,14 +72,16 @@ async def main():
         result = await actor.evaluate(
             task_id=task_id,
             base_url="https://openrouter.ai/api/v1",
-            model="openai/gpt-5",
+            model="mistralai/ministral-8b-2512",
             seed=random.randint(0, 1000000),
-            opponent="random"
         )
         
         return result
     
-    for game_id in range(1000, 1000 + len(AVAILABLE_GAMES)):
+    start_game_id = 1000 + (len(AVAILABLE_GAMES) - 1000 % len(AVAILABLE_GAMES)) # first 4-digit number that is divisible by len(AVAILABLE_GAMES)
+    for game_id in range(start_game_id, start_game_id + len(AVAILABLE_GAMES)):
+        if game_id % len(AVAILABLE_GAMES) in SKIP_INDICES:
+            continue
         # Process config_ids in batches of 4
         for batch_start in range(0, NUM_SAMPLE_PER_GAME, NUM_CONCURRENT):
             batch_end = min(batch_start + NUM_CONCURRENT, NUM_SAMPLE_PER_GAME)
